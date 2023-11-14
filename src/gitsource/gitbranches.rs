@@ -1,93 +1,125 @@
+use std::cell::Ref;
 use serde_derive::{Deserialize, Serialize};
 use reqwest;
 use std::error::Error;
-use std::thread::sleep;
 use std::time::Duration;
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use yaml_rust::{Yaml, YamlLoader, YamlEmitter};
 use serde_json;
 use crate::gitsource;
-use crate::gitsource::gitbranches::BranchEnum::{DEVELOP, STAGE, PREVIEW, MAIN};
+
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct Restrictions {
-    users: [String ;1],
-    teams: [String ;1],
-    apps: [String ;1]
+struct BypassActors {
+    actor_id: i16,
+    actor_type: String,
+    bypass_mode: String,
 }
 
-// The 'restrictions' object in the 'required_pull_request_reviews' property needs to be
-// empty in the API payload of the PUT request that creates the initial branch protections.
-// Otherwise, the 'Restrict who can dismiss pull request review' property will be enabled.
-// If the 'restrictions' structure contains any fields which are set to empty strings in the
-// payload, the above property will be enabled. Only if the 'restrictions' object is empty
-// will the property be disabled.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct DismissalRestrictions {}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Checks {
-    context: String,
-    app_id: i16
-}
-#[derive(Serialize, Deserialize, Debug)]
-struct RequiredPullRequestReviews {
-    dismissal_restrictions: DismissalRestrictions,
-    dismiss_stale_reviews: bool,
-    require_code_owner_reviews: bool,
-    required_approving_review_count: i8,
-    require_last_push_approval: bool,
-    bypass_pull_request_allowances: Restrictions
-}
-#[derive(Serialize, Deserialize, Debug)]
-struct RequiredStatusChecks {
-    strict: bool,
-    checks: [Checks; 1]
+struct RefName {
+    include: [String; 5],
+    exclude: [String; 0],
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct BranchProtection {
-    required_status_checks: RequiredStatusChecks,
-    enforce_admins: bool,
-    required_pull_request_reviews: RequiredPullRequestReviews,
-    restrictions: Restrictions,
-    required_linear_history: bool,
-    allow_force_pushes: bool,
-    allow_deletions: bool,
-    block_creations: bool,
-    required_conversation_resolution: bool,
-    lock_branch: bool,
-    allow_fork_syncing: bool
-}
-
-#[derive(Debug, Clone)]
-struct BranchSpecificProtections {
-    dismiss_stale_reviews: bool,
-    required_approving_review_count: i8,
-}
-
-#[derive(PartialEq)]
-enum BranchEnum {
-    DEVELOP,
-    STAGE,
-    PREVIEW,
-    MAIN
-}
-
-impl BranchEnum {
-    fn as_str(&self) -> &'static str {
-        match self {
-            DEVELOP => "develop",
-            STAGE => "stage",
-            PREVIEW => "preview",
-            MAIN => "main",
+/*
+impl RefName {
+    fn new(include: Vec<String>, exclude: Vec<String>) -> Self {
+        Self {
+            include: include.to_vec(),
+            exclude: exclude.to_vec(),
         }
     }
 }
+*/
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Conditions {
+    ref_name: RefName
+}
 
-const _MAX_ITERATIONS: i8 = 4;
-const _MAX_RETRIES: i8 = 3;
-const _INITIAL_RETRY_MS: u64 = 200;
+trait Rule {
+    fn r#type(&self) -> String;
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct DeletionRule {
+    r#type: String
+}
+
+impl Rule for DeletionRule {
+    fn r#type(&self) -> String {
+        return self.r#type.clone()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct PullRequestParameters {
+    dismiss_stale_reviews_on_push: bool,
+    require_code_owner_review: bool,
+    require_last_push_approval: bool,
+    required_approving_review_count: bool,
+    required_review_thread_resolution: bool
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct PullRequestRule {
+    r#type: String,
+    parameters: PullRequestParameters
+}
+
+impl Rule for PullRequestRule {
+    fn r#type(&self) -> String {
+        return self.r#type.clone()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct RequiredStatusChecksObjects {
+    context: String,
+    integration_id: i16,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct RequiredStatusChecksParameters {
+    required_status_checks: [RequiredStatusChecksObjects; 2],
+    strict_required_status_checks_policy: bool
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct RequiredStatusChecksRule {
+    r#type: String,
+    parameters: RequiredStatusChecksParameters
+
+}
+
+impl Rule for RequiredStatusChecksRule {
+    fn r#type(&self) -> String {
+        return self.r#type.clone()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct NonFastForwardRule {
+    r#type: String,
+}
+
+
+impl Rule for NonFastForwardRule {
+    fn r#type(&self) -> String {
+        return self.r#type.clone()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct RuleSet {
+    name: String,
+    repo: String,
+    target: String,
+    enforcement: String,
+    bypass_actors: BypassActors,
+    conditions: RefName,
+    rules: [dyn Rule; 3]
+}
 
 #[tokio::main]
 pub async fn process_github_branches(config_yaml: &Vec<Yaml> , settings_yaml: &Vec<Yaml>) -> Result<(bool), Box<dyn Error>> {
@@ -104,135 +136,28 @@ pub async fn process_github_branches(config_yaml: &Vec<Yaml> , settings_yaml: &V
     }
     let github_auth_token = github_auth_token_result.unwrap();
 
-    // TODO Currently, the template repo (Test-repo) doesn't have a qa branch and therefore
-    //      the tenant repo also will not have a qa branch
-    for branch in [DEVELOP, STAGE, PREVIEW, MAIN] {
-        println!("Adding Branch Protection for {} branch", branch.as_str());
-        let github_branch_protection_api = format!("https://api.github.com/repos/Fiserv/{}/branches/{}/protection", tenant_repo, branch.as_str());
-        let github_branch_protection_restrictions_api = github_branch_protection_api.clone() + "/restrictions";
+    let github_ruleset_api = format!("https://api.github.com/repos/Fiserv/{}//rulesets", tenant_repo);
 
-        let dismiss_stale_reviews: bool;
-        let required_approving_review_count: i8;
-
-        // TODO Should there be different protections for qa, stage, and main?
-        //      The Test-repo has the same branch protections for all non-develop branches
-        // TODO Test-repo only includes status checks on the develop branch. Do we
-        //      want status checks on all non-develop branches? (this code is adding
-        //      status checks on all branches)
-        if branch == DEVELOP {
-            dismiss_stale_reviews = false;
-            required_approving_review_count = 0;
-        } else {
-            dismiss_stale_reviews = true;
-            required_approving_review_count = 1;
-        }
-        let branch_specific_protections = BranchSpecificProtections {
-            dismiss_stale_reviews,
-            required_approving_review_count
-        };
-
-        // These properties are not used when applying the branch protections
-        // but are required by the API.
-        let restrictions = Restrictions {
-            users: [format!("{}", "")],
-            teams: [format!("{}", "")],
-            apps: [format!("{}", "")]
-        };
-
-        let checks_data = Checks {
-            context: format!("{}","validator / tenant-config-validator / Tenant-Config-Action"),
-            app_id: 15368
-        };
-
-        let required_status_checks = RequiredStatusChecks {
-            strict: true,
-            checks: [checks_data]
-        };
-
-        let required_pull_request_reviews = RequiredPullRequestReviews {
-            dismissal_restrictions: DismissalRestrictions{},
-            dismiss_stale_reviews: branch_specific_protections.dismiss_stale_reviews,
-            require_code_owner_reviews: false,
-            required_approving_review_count: branch_specific_protections.required_approving_review_count,
-            require_last_push_approval: false,
-            bypass_pull_request_allowances: restrictions.clone()
-        };
-
-        let branch_protection_data = BranchProtection {
-            required_status_checks,
-            enforce_admins: false,
-            required_pull_request_reviews,
-            restrictions: restrictions.clone(),
-            required_linear_history: false,
-            allow_force_pushes: false,
-            allow_deletions: false,
-            block_creations: false,
-            required_conversation_resolution: false,
-            lock_branch: false,
-            allow_fork_syncing: false
-        };
-
-        let github_client = reqwest::Client::new();
-
-        let mut iterations = 1;
-        let mut delay_ms = _INITIAL_RETRY_MS;
-        let mut branch_protections_created = false;
-        while iterations <= _MAX_ITERATIONS && !branch_protections_created {
-            let create_branch_protections_request =
-                create_request(reqwest::Method::PUT, github_branch_protection_api.clone(), github_auth_token.clone())
-                    .json(&branch_protection_data);
-            let create_branch_protections_response = create_branch_protections_request.send().await?;
-
-            let status = create_branch_protections_response.status();
-            println!("Branch Protection status: {}", status);
-            if status != StatusCode::OK {
-                if status != StatusCode::NOT_FOUND {
-                    return Err(Box::try_from(create_branch_protections_response.status().as_str()).unwrap());
-                }
-
-                if iterations > _MAX_RETRIES {
-                    println!("aborting");
-                    break;
-                }
-
-                println!("retrying with {}ms delay", delay_ms);
-                sleep(Duration::from_millis(delay_ms));
-                iterations += 1;
-                delay_ms = delay_ms * 2;
-                continue;
-            }
-
-            let res_body = create_branch_protections_response.bytes().await?;
-            let str_body = res_body.to_vec();
-            let str_response = String::from_utf8_lossy(&str_body);
-            println!("Response: {} ", str_response);
-
-            println!("Disabling Unwanted Restrictions for {} branch", branch.as_str());
-            let delete_restrictions_request =
-                create_request(reqwest::Method::DELETE, github_branch_protection_restrictions_api.clone(), github_auth_token.clone());
-            let delete_restrictions_response = delete_restrictions_request.send().await?;
-            println!("Status: {}", delete_restrictions_response.status());
-
-            // There is no retrying when making the call to delete unwanted restrictions.
-            // This call is only made if the call to create the branch protections succeeds.
-            // The assumption is, if the call to create the branch protections succeeds, the
-            // branch exists and therefore there will be no 404 error deleting the unwanted
-            // branch restrictions.
-            if delete_restrictions_response.status() != StatusCode::NO_CONTENT {
-                return Err(Box::try_from(delete_restrictions_response.status().as_str()).unwrap());
-            }
-
-            branch_protections_created = true;
-        }
-
-        if !branch_protections_created {
-            // If the branch protections failed for a single branch due to the branch not yet existing, abort all
-            // branch protection creation
-            created = false;
-            break;
-        }
-        created = true;
-    }
+    let x = RefName {
+        include: [
+            format!("{}", "refs/heads/main".to_string()),
+            format!("{}", "refs/heads/develop".to_string()),
+            format!("{}", "refs/heads/stage".to_string()),
+            format!("{}", "refs/heads/preview".to_string()),
+            format!("{}", "refs/heads/previous".to_string()),
+        ],
+        exclude: [],
+    };
+            /*
+    let refName =
+        RefName::new(vec![
+            "refs/heads/main".to_string(),
+            "refs/heads/develop".to_string(),
+            "refs/heads/stage".to_string(),
+            "refs/heads/preview".to_string(),
+            "refs/heads/previous".to_string(),
+            ], vec!["".to_string()]);
+             */
 
     Ok(created)
 }
